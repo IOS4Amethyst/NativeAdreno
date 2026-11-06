@@ -29,6 +29,10 @@ class NativeAdrenoUserClient final {
         uint32_t token=0;
         uint32_t mapping_leases=0;
         uint32_t index=0;   /* its place in the chunks: token - 1 */
+        /* Freed while this client's jobs could still read it (msm keeps a submit's objects until it retires): no longer findable, still
+         * mapped and backed until the ring's fence passes free_fence, this client's newest submission at the free. */
+        bool zombie=false;
+        uint32_t free_fence=0;
         char metadata[NativeAdrenoAbiMetadataBytes]{};
     };
     /* Entries in chunks of EntryChunk, allocated as the client's objects grow (a whole table per client was about 4 MiB, and every process
@@ -70,6 +74,12 @@ class NativeAdrenoUserClient final {
     uint64_t window_start_=0,window_bytes_=0,window_peak_=0;
     uint64_t next_handle_=1;
     bool open_=false;
+    uint32_t last_fence_=0;   /* this client's newest submission */
+    size_t zombies_=0;
+    const NativeAdrenoRingClock *clock_=nullptr;   /* dispatch()'s, for a map that must wait for a zombie at its address */
+    bool fencePassed(uint32_t fence);
+    void reapZombies();
+    IOReturn waitZombiesAt(uint64_t iova,uint64_t end);
     Entry *find(uint64_t);
     Entry *free();
     void clear(Entry &);

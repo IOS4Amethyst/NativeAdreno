@@ -56,6 +56,8 @@ void NativeAdrenoUserClient::clear(Entry &entry)
     entry.handle=0;entry.mapped=0;entry.iova=0;entry.used=false;
     entry.mapped_state=false;entry.unreleasable=false;entry.imported=false;entry.metadata_bytes=0;
     entry.token=0;entry.mapping_leases=0;
+    if(entry.zombie && zombies_)--zombies_;
+    entry.zombie=false;entry.free_fence=0;
 }
 /* A free entry, with room in the handle index for it to be published; null without memory. */
 NativeAdrenoUserClient::Entry *NativeAdrenoUserClient::free()
@@ -169,6 +171,8 @@ IOReturn NativeAdrenoUserClient::releaseAll(const NativeAdrenoRingClock *clock,u
     if(!clock)return kIOReturnBadArgument;
     IOReturn status=(scoped_ || used_)?submit_->waitRange(queue_base_,NativeAdrenoQueueRange,clock,timeout_us):kIOReturnSuccess;
     if(status)return status;
+    reapZombies();
+    if(zombies_)return kIOReturnBusy;
     for(size_t index=0;index<entry_count_;++index) {
         Entry &entry=at(index);
         if(!entry.used)continue;
@@ -217,6 +221,7 @@ static void noteLive(uint32_t slot,size_t live) {
 IOReturn NativeAdrenoUserClient::allocBo(const NativeAdrenoAbiBoAlloc *request,
     NativeAdrenoAbiBoAllocReply *reply)
 {
+    if(open_)reapZombies();
     const IOReturn status=allocBoInner(request,reply);
     if(status && request) {
         volatile uint32_t *stats=clientStats(stats_slot_);
@@ -316,6 +321,7 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
         }
         return kIOReturnBadArgument;
     }
+    {const IOReturn waited=waitZombiesAt(request->iova,end);if(waited)return waited;}
     uint64_t handle=0;
     /* Memory the owner maps read-only could only be pinned for reading: the GPU gets the read half of what was asked. */
     const unsigned permissions=entry->memory.readOnly()?(request->permissions&~2u):request->permissions;
@@ -341,6 +347,51 @@ static void noteFreeRefused(bool imported,uint64_t handle,IOReturn status)
     if(!imported)return;
     native_adreno_import_live[1]=native_adreno_import_live[1]+1;native_adreno_import_live[2]=(uint32_t)status;noteImportState(handle,3);
 }
+/* Deferred frees: [0] deferred, [1] reaped, [2] maps that waited for one at their address, [3] waiting now, [4] reaps refused, [5] waits
+ * that timed out. */
+extern "C" {volatile uint32_t native_adreno_deferred_frees[6];}
+bool NativeAdrenoUserClient::fencePassed(uint32_t fence)
+{
+    uint32_t done=0;
+    if(ring_->fenceValue(&done))done=ring_->completedFence();
+    return (int32_t)(done-fence)>=0;
+}
+void NativeAdrenoUserClient::reapZombies()
+{
+    if(!zombies_)return;
+    bool retired=false;
+    for(size_t index=0;index<entry_count_ && zombies_;++index) {
+        Entry &entry=at(index);
+        if(!entry.used || !entry.zombie || !fencePassed(entry.free_fence))continue;
+        if(!retired) {submit_->retireCompleted();retired=true;}
+        if(entry.mapped_state) {
+            if(vm_->unmap(entry.mapped)) {native_adreno_deferred_frees[4]=native_adreno_deferred_frees[4]+1;continue;}
+            entry.mapped_state=false;entry.mapped=0;entry.iova=0;
+        }
+        if(entry.memory.release()) {native_adreno_deferred_frees[4]=native_adreno_deferred_frees[4]+1;continue;}
+        if(entry.imported) {native_adreno_import_live[0]=native_adreno_import_live[0]-1;noteImportState(entry.handle,2);}
+        clear(entry);
+        native_adreno_deferred_frees[1]=native_adreno_deferred_frees[1]+1;
+        native_adreno_deferred_frees[3]=native_adreno_deferred_frees[3]-1;
+    }
+}
+/* Turnip-style clients reuse a freed address at once: a map over a zombie waits for the zombie's fence (500 ms) and frees it first. */
+IOReturn NativeAdrenoUserClient::waitZombiesAt(uint64_t iova,uint64_t end)
+{
+    reapZombies();
+    for(size_t index=0;index<entry_count_ && zombies_;++index) {
+        Entry &entry=at(index);
+        if(!entry.used || !entry.zombie || !entry.mapped_state)continue;
+        const uint64_t zend=entry.iova+entry.memory.bytes();
+        if(end<=entry.iova || iova>=zend)continue;
+        native_adreno_deferred_frees[2]=native_adreno_deferred_frees[2]+1;
+        if(clock_ && submit_->observeFence(entry.free_fence,clock_,500000)) {}
+        if(!fencePassed(entry.free_fence)) {native_adreno_deferred_frees[5]=native_adreno_deferred_frees[5]+1;return kIOReturnBusy;}
+        reapZombies();
+        if(entry.used && entry.zombie)return kIOReturnBusy;
+    }
+    return kIOReturnSuccess;
+}
 IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
 {
     native_adreno_trace_stage=1;
@@ -351,6 +402,17 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
     if(entry->unreleasable) {noteFreeRefused(entry->imported,entry->handle,kIOReturnBusy);return kIOReturnBusy;}
     if(entry->mapping_leases) {noteFreeRefused(entry->imported,entry->handle,kIOReturnBusy);return kIOReturnBusy;}
     native_adreno_trace_stage=2;
+    reapZombies();
+    /* GPU hang i-v56: Spotlight freed a texture its queued job still read (a submission pins only its IBs), the unmap left the GPU a
+     * translation fault (FSR 0x80000402) and the CP never finished the job. Like msm's object references, the unmap and the release wait
+     * until the CP has passed every submission this client made before the free. */
+    if(entry->mapped_state && last_fence_ && !fencePassed(last_fence_)) {
+        index_.erase(entry->handle);
+        entry->zombie=true;entry->free_fence=last_fence_;++zombies_;
+        native_adreno_deferred_frees[0]=native_adreno_deferred_frees[0]+1;
+        native_adreno_deferred_frees[3]=native_adreno_deferred_frees[3]+1;
+        return kIOReturnSuccess;
+    }
     if(entry->mapped_state) {
         /* Completed jobs must not pin the buffer: retire what the CP has passed before the unmap decides. */
         submit_->retireCompleted(); /* a poisoned execbuf refuses and the unmap below stays refused too */
@@ -405,6 +467,7 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     vm_->setOwner(0);
     if(status)return status;
     native_adreno_submit_stats[fence&255]=request->reserved;
+    last_fence_=fence;
     reply->fence=fence;
     return kIOReturnSuccess;
 }
@@ -520,6 +583,7 @@ IOReturn NativeAdrenoUserClient::dispatch(uint32_t method,const void *input,
     native_adreno_vm_now_us=[]()->uint64_t{return vm_clock && vm_clock->now_us?vm_clock->now_us(vm_clock->cookie):0;};
     IOReturn tally_result=kIOReturnSuccess;
     Tally tally(method,&tally_result,clock);
+    clock_=clock;
     const size_t expected_in=inputSize(method),expected_out=outputSize(method);
     if(expected_in==SIZE_MAX || expected_out==SIZE_MAX)return kIOReturnUnsupported;
     if(input_size!=expected_in || output_size!=expected_out)return kIOReturnBadArgument;
