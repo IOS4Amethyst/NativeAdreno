@@ -126,6 +126,7 @@ public:
     /* a6xx_progress's CP state: IB1 base (lo, hi), IB2 base (lo, hi), IB1 remaining and IB2 remaining dwords, each remaining count plus
      * what the ROQ fetched but the SQE has not consumed (CP_ROQ_AVAIL_IB1/IB2 bits 31:16). */
     IOReturn progressState(uint32_t out[6]);
+    IOReturn gpuBusy(bool *busy);
     /* a6xx_bus_clear_pending_transactions(gx_off): with gx_off the GX side of GBIF first (RBBM_GBIF_HALT), then new client requests and
      * all AXI requests, each until acknowledged (spin_until: bounded here by `spins` reads), then the halt cleared. */
     IOReturn busHalt(bool gx_off,unsigned spins);

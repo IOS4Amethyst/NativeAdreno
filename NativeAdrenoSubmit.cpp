@@ -48,7 +48,7 @@ static void peekFetch(const NativeAdrenoVm *vm,uint64_t fetch,volatile uint32_t 
     for(unsigned i=0;i<16;++i)slot[1+i]=words[i];
 }
 static uint32_t stall_fence,stall_timeouts,stall_stage;   /* stage: 0 none yet, 1 write pointer given again, 2 translations dropped, 3 bus drained */
-static uint64_t stall_began_us,stall_last_us;   /* the fence's first and latest timed-out wait */
+static uint64_t stall_began_us,stall_last_us,stall_first_us;   /* the fence's first and latest timed-out wait */
 static uint32_t stall_begin_cp_[6];   /* the CP's progress at the stalled fence's first timed-out wait (upstream a7219e63) */
 /* Stall-handler first stages skipped because the CP was still moving (a long job, not a stop). */
 extern "C" {volatile uint32_t native_adreno_stall_working;}
@@ -344,7 +344,7 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
             uint32_t bucket=0;while(bucket<7 && ms>=(1ull<<bucket))++bucket;
             native_adreno_fence_pending[bucket]=native_adreno_fence_pending[bucket]+1;
         }
-        stall_began_us=now;stall_snapshots=0;
+        stall_began_us=now;stall_first_us=now;stall_snapshots=0;
         /* The CP moved on: what the stall that just ended took to clear. [9] first-stage recoveries, [10] second, [11] third, [12] timeouts of the longest. */
         if(stall_stage && stall_timeouts) {
             native_adreno_unstick[8+stall_stage]=native_adreno_unstick[8+stall_stage]+1;
@@ -366,9 +366,11 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
         if(ring_->progressState(at))for(unsigned k=0;k<6;++k)at[k]=~0u;
         IODelay(500);
         if(ring_->progressState(later))for(unsigned k=0;k<6;++k)later[k]=~0u;
-        bool moved=false;
+        bool moved=false,busy=false;
         for(unsigned k=0;k<6;++k)if(at[k]!=stall_begin_cp_[k] || later[k]!=at[k])moved=true;
-        if(moved) {
+        /* A busy GPU (RBBM) is working too. Both are trusted for at most 2 s of one fence, so a real hang still reaches the stages. */
+        if(!ring_->gpuBusy(&busy) && busy)moved=true;
+        if(moved && now-stall_first_us<2000000) {
             native_adreno_stall_working=native_adreno_stall_working+1;
             stall_began_us=now;pending=0;
             for(unsigned k=0;k<6;++k)stall_begin_cp_[k]=later[k];

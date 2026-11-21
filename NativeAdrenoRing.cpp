@@ -354,19 +354,43 @@ IOReturn NativeAdrenoRing::idle(const NativeAdrenoRingClock *clock,uint32_t time
 IOReturn NativeAdrenoRing::progressState(uint32_t out[6])
 {
     /* a6xx.xml: the A6XX-A7XX offsets, and the A8XX ones (CP_IB1_BASE 0x0900, CP_IB1_REM_SIZE 0x0902, CP_IB2_BASE 0x0904,
-     * CP_IB2_REM_SIZE 0x0906, CP_ROQ_AVAIL_IB1/IB2 0x0919/0x091a). On gen8 the gen7 offsets name other registers, so the stall
-     * handler compared registers that never moved and could not tell a working CP from a stopped one. */
-    const bool gen8=regs_ && regs_->generation>=8;
-    const uint32_t Ib1Base=gen8?0x0900u:0x0928u,Ib1Rem=gen8?0x0902u:0x092au,Ib2Base=gen8?0x0904u:0x092bu,
-        Ib2Rem=gen8?0x0906u:0x092du,RoqAvailIb1=gen8?0x0919u:0x0949u,RoqAvailIb2=gen8?0x091au:0x094au;
+     * CP_IB2_REM_SIZE 0x0906, CP_ROQ_AVAIL_IB1/IB2 0x0919/0x091a). */
     if(!out)return kIOReturnBadArgument;
     if(!attached_)return kIOReturnNotReady;
+    if(regs_ && regs_->generation>=8 && regs_->aperture) {
+        /* gen8: these are pipe registers, read behind CP_APERTURE_CNTL_HOST (a8xx_read_pipe_slice, slice 0). Read with the aperture at
+         * PIPE_NONE they return 0xdeafbead (amethyst b27: every sample equal, so the working-CP check never fired: working=0, 305 kicks).
+         * BR's IB1/IB2 state, BV's IB1 base and remaining count, and the ring read pointer, which moves between submissions. */
+        uint32_t br[8]={},bv[3]={},rptr=0;
+        static const uint32_t offs[8]={0x0900,0x0901,0x0904,0x0905,0x0902,0x0906,0x0919,0x091a};
+        const uint32_t shift=regs_->aperture_pipe_shift;
+        bool bad=io_.write32(io_.cookie,regs_->aperture,1u<<shift);
+        for(unsigned i=0;i<8 && !bad;++i)bad=io_.read32(io_.cookie,offs[i],&br[i]);
+        if(!bad)bad=io_.write32(io_.cookie,regs_->aperture,2u<<shift);
+        if(!bad)bad=io_.read32(io_.cookie,0x0900,&bv[0]) || io_.read32(io_.cookie,0x0902,&bv[1]) || io_.read32(io_.cookie,0x0919,&bv[2]);
+        if(io_.write32(io_.cookie,regs_->aperture,0))bad=true;
+        if(bad || io_.read32(io_.cookie,RingRptr,&rptr))return kIOReturnIOError;
+        out[0]=br[0];out[1]=br[1]^bv[0];out[2]=br[2];out[3]=br[3]^rptr;
+        out[4]=br[4]+(br[6]>>16);out[5]=br[5]+(br[7]>>16)+((bv[1]+(bv[2]>>16))<<16);
+        return kIOReturnSuccess;
+    }
     uint32_t roq1=0,roq2=0;
-    if(io_.read32(io_.cookie,Ib1Base,&out[0]) || io_.read32(io_.cookie,Ib1Base+1,&out[1]) ||
-        io_.read32(io_.cookie,Ib2Base,&out[2]) || io_.read32(io_.cookie,Ib2Base+1,&out[3]) ||
-        io_.read32(io_.cookie,Ib1Rem,&out[4]) || io_.read32(io_.cookie,Ib2Rem,&out[5]) ||
-        io_.read32(io_.cookie,RoqAvailIb1,&roq1) || io_.read32(io_.cookie,RoqAvailIb2,&roq2))return kIOReturnIOError;
+    if(io_.read32(io_.cookie,0x0928,&out[0]) || io_.read32(io_.cookie,0x0929,&out[1]) ||
+        io_.read32(io_.cookie,0x092b,&out[2]) || io_.read32(io_.cookie,0x092c,&out[3]) ||
+        io_.read32(io_.cookie,0x092a,&out[4]) || io_.read32(io_.cookie,0x092d,&out[5]) ||
+        io_.read32(io_.cookie,0x0949,&roq1) || io_.read32(io_.cookie,0x094a,&roq2))return kIOReturnIOError;
     out[4]+=roq1>>16;out[5]+=roq2>>16;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoRing::gpuBusy(bool *busy)
+{
+    /* RBBM_STATUS GPU_BUSY_IGN_AHB (bit 23): 0x0210 on A6XX-A7XX, 0x0012 on A8XX. A lost write pointer leaves the GPU idle with work in
+     * the ring (int-317); a busy GPU is still running a long job. */
+    if(!busy)return kIOReturnBadArgument;
+    if(!attached_)return kIOReturnNotReady;
+    uint32_t status=0;
+    if(io_.read32(io_.cookie,regs_ && regs_->generation>=8?0x0012u:0x0210u,&status))return kIOReturnIOError;
+    *busy=(status>>23)&1;
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoRing::busHalt(bool gx_off,unsigned spins)
