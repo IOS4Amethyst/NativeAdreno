@@ -48,7 +48,8 @@ static void peekFetch(const NativeAdrenoVm *vm,uint64_t fetch,volatile uint32_t 
     for(unsigned i=0;i<16;++i)slot[1+i]=words[i];
 }
 static uint32_t stall_fence,stall_timeouts,stall_stage;   /* stage: 0 none yet, 1 write pointer given again, 2 translations dropped, 3 bus drained */
-static uint64_t stall_began_us,stall_last_us,stall_first_us;   /* the fence's first and latest timed-out wait */
+static uint64_t stall_began_us,stall_last_us,stall_first_us;   /* the fence's first and latest timed-out wait, and the first (never reset) */
+static bool stall_nudged;   /* the write pointer was given again early for this fence */
 static uint32_t stall_begin_cp_[6];   /* the CP's progress at the stalled fence's first timed-out wait (upstream a7219e63) */
 /* Stall-handler first stages skipped because the CP was still moving (a long job, not a stop). */
 extern "C" {volatile uint32_t native_adreno_stall_working;}
@@ -344,7 +345,7 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
             uint32_t bucket=0;while(bucket<7 && ms>=(1ull<<bucket))++bucket;
             native_adreno_fence_pending[bucket]=native_adreno_fence_pending[bucket]+1;
         }
-        stall_began_us=now;stall_first_us=now;stall_snapshots=0;
+        stall_began_us=now;stall_first_us=now;stall_snapshots=0;stall_nudged=false;
         /* The CP moved on: what the stall that just ended took to clear. [9] first-stage recoveries, [10] second, [11] third, [12] timeouts of the longest. */
         if(stall_stage && stall_timeouts) {
             native_adreno_unstick[8+stall_stage]=native_adreno_unstick[8+stall_stage]+1;
@@ -361,16 +362,24 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
      * 160 ms), not a lost write pointer: nothing is done to it, and the stages count their time from this sample, so they act only
      * after that long without progress. Dropping the translations and giving the write pointer again under a working CP was a
      * visible hitch (amethyst b24: 1177 first-stage kicks in 20 minutes). Needs progressState's gen8 offsets on the A810. */
+    /* amethyst b29: a stalled fence is nearly always a write pointer the CP never took (int-317; b28 measured that waiting does not end
+     * it). Giving the same write pointer again is harmless to a busy CP, so do it once per fence after 5 ms, without the TLB drop the
+     * 50 ms stage adds. High 16 bits of native_adreno_stall_working count these. */
+    if(now && stall_stage==0 && !stall_nudged && now-stall_first_us>=5000) {
+        stall_nudged=true;(void)ring_->kick();
+        native_adreno_stall_working=native_adreno_stall_working+0x10000u;
+    }
     if(now && stage_due(stall_stage,0,pending,50000)) {
         uint32_t at[6]={},later[6]={};
         if(ring_->progressState(at))for(unsigned k=0;k<6;++k)at[k]=~0u;
         IODelay(500);
         if(ring_->progressState(later))for(unsigned k=0;k<6;++k)later[k]=~0u;
-        bool moved=false,busy=false;
+        bool moved=false;
         for(unsigned k=0;k<6;++k)if(at[k]!=stall_begin_cp_[k] || later[k]!=at[k])moved=true;
-        /* A busy GPU (RBBM) is working too. Both are trusted for at most 2 s of one fence, so a real hang still reaches the stages. */
-        if(!ring_->gpuBusy(&busy) && busy)moved=true;
-        if(moved && now-stall_first_us<2000000) {
+        /* amethyst b28: trusting RBBM busy (and moving IB words) for up to 2 s made throughput fall from 10.6 to 6.2 jobs/s (fence
+         * waits 63 s -> 277 s, longest 2.05 s): the stalled CP reports busy and the kick is what ends it. Only CP progress counts now,
+         * for at most 100 ms of one fence. Low 16 bits: first-stage kicks skipped. */
+        if(moved && now-stall_first_us<100000) {
             native_adreno_stall_working=native_adreno_stall_working+1;
             stall_began_us=now;pending=0;
             for(unsigned k=0;k<6;++k)stall_begin_cp_[k]=later[k];
