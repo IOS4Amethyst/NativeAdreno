@@ -49,6 +49,9 @@ static void peekFetch(const NativeAdrenoVm *vm,uint64_t fetch,volatile uint32_t 
 }
 static uint32_t stall_fence,stall_timeouts,stall_stage;   /* stage: 0 none yet, 1 write pointer given again, 2 translations dropped, 3 bus drained */
 static uint64_t stall_began_us,stall_last_us;   /* the fence's first and latest timed-out wait */
+static uint32_t stall_begin_cp_[6];   /* the CP's progress at the stalled fence's first timed-out wait (upstream a7219e63) */
+/* Stall-handler first stages skipped because the CP was still moving (a long job, not a stop). */
+extern "C" {volatile uint32_t native_adreno_stall_working;}
 /* How long fences stayed pending from their first timed-out wait to their last: [i] under 1 << i ms for i < 7, [7] 64 ms or more. */
 extern "C" {volatile uint32_t native_adreno_fence_pending[8];}
 /* What the stall handler tried: [0] attempts, [1] the fence of the last attempt, [2] attempts after which that fence completed, [3] the
@@ -348,9 +351,29 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
             if(stall_timeouts>native_adreno_unstick[12])native_adreno_unstick[12]=stall_timeouts;
         }
         stall_fence=next;stall_timeouts=0;stall_stage=0;
+        /* Where the CP was at the fence's first timed-out wait, to tell at the first stage whether it moved since (upstream a7219e63). */
+        if(ring_->progressState(stall_begin_cp_))for(unsigned i=0;i<6;++i)stall_begin_cp_[i]=~0u;
     }
     stall_last_us=now;
-    const uint64_t pending=now-stall_began_us;
+    uint64_t pending=now-stall_began_us;
+    /* UniXNU/Adreno740 a7219e63 "leave a working GPU alone in the stall handler": before the first stage acts, where the CP is now and
+     * 500 us later. Moved since the first wait or over the 500 us, it is still working through a long job (tiled passes of 100 to
+     * 160 ms), not a lost write pointer: nothing is done to it, and the stages count their time from this sample, so they act only
+     * after that long without progress. Dropping the translations and giving the write pointer again under a working CP was a
+     * visible hitch (amethyst b24: 1177 first-stage kicks in 20 minutes). Needs progressState's gen8 offsets on the A810. */
+    if(now && stage_due(stall_stage,0,pending,50000)) {
+        uint32_t at[6]={},later[6]={};
+        if(ring_->progressState(at))for(unsigned k=0;k<6;++k)at[k]=~0u;
+        IODelay(500);
+        if(ring_->progressState(later))for(unsigned k=0;k<6;++k)later[k]=~0u;
+        bool moved=false;
+        for(unsigned k=0;k<6;++k)if(at[k]!=stall_begin_cp_[k] || later[k]!=at[k])moved=true;
+        if(moved) {
+            native_adreno_stall_working=native_adreno_stall_working+1;
+            stall_began_us=now;pending=0;
+            for(unsigned k=0;k<6;++k)stall_begin_cp_[k]=later[k];
+        }
+    }
     /* A fence that stops while the CP sits idle with work in the ring (int-317 hung with RBBM idle, RPTR short of WPTR, both threads at the same
      * cache clean) is nearly always a write pointer the CP never took: giving it again after a few waits ends it in a couple of milliseconds
      * (i343: 206 of 213 stalls ended at the second stage, 60 to 85 ms each, most of it the 100 waits before the write). After 10 waits now:

@@ -353,7 +353,12 @@ IOReturn NativeAdrenoRing::idle(const NativeAdrenoRingClock *clock,uint32_t time
 }
 IOReturn NativeAdrenoRing::progressState(uint32_t out[6])
 {
-    enum : uint32_t {Ib1Base=0x0928,Ib1Rem=0x092a,Ib2Base=0x092b,Ib2Rem=0x092d,RoqAvailIb1=0x0949,RoqAvailIb2=0x094a};
+    /* a6xx.xml: the A6XX-A7XX offsets, and the A8XX ones (CP_IB1_BASE 0x0900, CP_IB1_REM_SIZE 0x0902, CP_IB2_BASE 0x0904,
+     * CP_IB2_REM_SIZE 0x0906, CP_ROQ_AVAIL_IB1/IB2 0x0919/0x091a). On gen8 the gen7 offsets name other registers, so the stall
+     * handler compared registers that never moved and could not tell a working CP from a stopped one. */
+    const bool gen8=regs_ && regs_->generation>=8;
+    const uint32_t Ib1Base=gen8?0x0900u:0x0928u,Ib1Rem=gen8?0x0902u:0x092au,Ib2Base=gen8?0x0904u:0x092bu,
+        Ib2Rem=gen8?0x0906u:0x092du,RoqAvailIb1=gen8?0x0919u:0x0949u,RoqAvailIb2=gen8?0x091au:0x094au;
     if(!out)return kIOReturnBadArgument;
     if(!attached_)return kIOReturnNotReady;
     uint32_t roq1=0,roq2=0;
