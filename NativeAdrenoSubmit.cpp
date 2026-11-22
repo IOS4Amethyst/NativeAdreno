@@ -550,11 +550,17 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
         NativeAdrenoVm *vm=guilty->vm?guilty->vm:vm_;
         vm->noteHang(vm!=vm_);out->guilty=vm;
     }
-    IOReturn status=restart(cookie,ring_,hung);
+    /* amethyst b31a: dropping the hung job (msm's recover) lost one of backboardd's frames, and the render server exited right after a
+     * restart that otherwise succeeded, taking SpringBoard with it. The A810's hangs are a CP that stopped taking work, not a bad
+     * command stream, so the hung job runs again once; the same fence hanging a second time is dropped as before. */
+    static uint32_t retried_fence;
+    const bool retry=guilty && hung!=retried_fence;
+    retried_fence=retry?hung:0;
+    IOReturn status=restart(cookie,ring_,retry?fence:hung);
     out->status=status;
     if(status)return poison();
     poisoned_=false;hang_fence_=hung;progress_retries_=0;
-    if(guilty) {status=release(*guilty);if(status)return status;}
+    if(guilty && !retry) {status=release(*guilty);if(status)return status;}
     /* The GPU is idle after the restart's CP init: the CPU installs the kernel table, and each replayed job switches to its own. */
     if(table_mode_) {
         if(!write_table_ || write_table_(table_cookie_,vm_->ttbr0()))return poison();
@@ -563,7 +569,7 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     }
     uint32_t nop=0;
     if(AdrenoPM4Type7(0x10,0,&nop)!=AdrenoPM4Success)return poison();   /* CP_NOP */
-    for(uint32_t next=hung+1;next && next<=last;++next) {
+    for(uint32_t next=retry?hung:hung+1;next && next<=last;++next) {
         Job *job=find(next);
         NativeAdrenoVm *vm=job && job->vm?job->vm:vm_;
         const bool run=job && !vm->unusable() && job->word_count;
@@ -571,7 +577,7 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
             /* amethyst b31: useVm's waitAll also waits for the jobs not replayed yet, whose fences cannot pass, so the first
              * replayed job of another address space timed out after 2 s and the restart failed every client (SpringBoard crashed,
              * the UI fell back to software). Only the jobs already replayed must finish before the CPU writes TTBR0. */
-            if(next>hung+1) {
+            if(next>(retry?hung:hung+1)) {
                 uint32_t observed=0;
                 if(ring_->wait(next-1,clock,2000000,&observed)!=NativeAdrenoRingFenceComplete)return poison();
             }
