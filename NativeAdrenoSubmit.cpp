@@ -567,8 +567,21 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
         Job *job=find(next);
         NativeAdrenoVm *vm=job && job->vm?job->vm:vm_;
         const bool run=job && !vm->unusable() && job->word_count;
-        status=useVm(vm,clock);
-        if(status)return poison();
+        if(table_mode_==1 && vm!=table_vm_) {
+            /* amethyst b31: useVm's waitAll also waits for the jobs not replayed yet, whose fences cannot pass, so the first
+             * replayed job of another address space timed out after 2 s and the restart failed every client (SpringBoard crashed,
+             * the UI fell back to software). Only the jobs already replayed must finish before the CPU writes TTBR0. */
+            if(next>hung+1) {
+                uint32_t observed=0;
+                if(ring_->wait(next-1,clock,2000000,&observed)!=NativeAdrenoRingFenceComplete)return poison();
+            }
+            if(!write_table_ || write_table_(table_cookie_,vm->ttbr0()))return poison();
+            native_adreno_table_switches[1]=native_adreno_table_switches[1]+1;
+            table_vm_=vm;
+        } else {
+            status=useVm(vm,clock);
+            if(status)return poison();
+        }
         ring_->useContext(job?job->context:0);
         uint32_t value=0;
         status=ring_->submitFramed(run?job->words:&nop,run?job->word_count:1,&value);
